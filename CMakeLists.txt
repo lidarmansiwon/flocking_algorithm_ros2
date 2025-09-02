@@ -12,6 +12,7 @@ find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(mss_msgs REQUIRED)
 
 
 include_directories(
@@ -44,6 +45,7 @@ geometry_msgs
 nav_msgs
 tf2
 tf2_geometry_msgs
+mss_msgs
 )
 
 
@@ -61,6 +63,7 @@ geometry_msgs
 nav_msgs
 tf2
 tf2_geometry_msgs
+mss_msgs
 )
 
 
