@@ -6,72 +6,127 @@ using std::placeholders::_1;
 namespace flocking
 {
 
+// 패턴 문자열에서 %d 치환
+std::string FlockingNode::make_topic_from_pattern(const std::string &pattern, size_t idx)
+{
+  char buf[256];
+  std::snprintf(buf, sizeof(buf), pattern.c_str(), static_cast<int>(idx));
+  return std::string(buf);
+}
+
 FlockingNode::FlockingNode() : rclcpp::Node("flocking_node")
 {
-    agent_id_       = this->declare_parameter<std::string>("agent_id", "agent_01");
-    own_odom_topic_ = this->declare_parameter<std::string>("own_odom_topic", "/odom");
-    cmd_vel_topic_  = this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
-    loop_rate_hz_   = this->declare_parameter<double>("loop_rate_hz", 20.0);
+    // --- 멀티 에이전트 파라미터 ---
+    agent_count_      = static_cast<size_t>(this->declare_parameter<int>("agent_count", 1));
+    agent_id_prefix_  = this->declare_parameter<std::string>("agent_id_prefix", "agent_");
+    own_odom_pattern_ = this->declare_parameter<std::string>("own_odom_pattern", "/agent_%d/odom");
+    cmd_vel_pattern_  = this->declare_parameter<std::string>("cmd_vel_pattern", "/agent_%d/cmd_vel");
 
+    loop_rate_hz_   = this->declare_parameter<double>("loop_rate_hz", 20.0);    // 주기 
 
-    r_neighbor_     = this->declare_parameter<double>("r_neighbor", 8.0);
+    // 보이드 반경 및 가중치 
+    r_neighbor_     = this->declare_parameter<double>("r_neighbor", 8.0);   
     r_separation_   = this->declare_parameter<double>("r_separation", 2.0);
-    k_sep_          = this->declare_parameter<double>("k_sep", 1.5);
+    k_sep_          = this->declare_parameter<double>("k_sep", 5.5);
     k_align_        = this->declare_parameter<double>("k_align", 0.6);
     k_coh_          = this->declare_parameter<double>("k_coh", 0.4);
     k_bound_        = this->declare_parameter<double>("k_bound", 1.0);
-    max_speed_      = this->declare_parameter<double>("max_speed", 2.0);
-    max_force_      = this->declare_parameter<double>("max_force", 1.0);
+    // 속도/가속 Max 설정
+    max_speed_      = this->declare_parameter<double>("max_speed", 100.0);
+    max_force_      = this->declare_parameter<double>("max_force", 100.0);
+    // Yaw 제어 이득
     k_yaw_          = this->declare_parameter<double>("k_yaw", 1.5);
+    // 상태 만료 시간
     stale_sec_      = this->declare_parameter<double>("stale_sec", 1.0);
 
-
+    // 경계 사용 여부 and 영역
     use_boundary_   = this->declare_parameter<bool>("use_boundary", true);
     xmin_           = this->declare_parameter<double>("xmin", -50.0);
     xmax_           = this->declare_parameter<double>("xmax", 50.0);
     ymin_           = this->declare_parameter<double>("ymin", -50.0);
     ymax_           = this->declare_parameter<double>("ymax", 50.0);   
 
-    // Publishers & Subscribers
-    own_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        own_odom_topic_, rclcpp::SensorDataQoS(),  
-        std::bind(&FlockingNode::ownOdomCallback, this, _1)  
-    );
+    // k_sep ↑ → 충돌 회피 강해짐(너무 크면 분산/진동).
 
+    // k_align ↑ → 같은 방향으로 정렬(과하면 열 형태로 길게 늘어지기도).
+
+    // k_coh ↑ → 응집 강화(과하면 뭉침/정체).
+
+    // r_separation & r_neighbor → 누가 이웃인지의 범위 결정(밀도/응답성에 큰 영향).
+
+    // max_force & max_speed → 응답의 민첩도/안정성 트레이드오프.
+
+    // k_yaw → 선체 요 응답 보정(너무 크면 오버슈트/진동).
+
+    // --- 에이전트 ID 및 I/O 동적 생성 ---
+    agent_ids_.resize(agent_count_);
+    own_odom_subs_.resize(agent_count_);
+    cmd_pubs_.resize(agent_count_);
+
+    for (size_t i = 0; i < agent_count_; ++i)
+    {
+        agent_ids_[i] = agent_id_prefix_ + std::to_string(i);
+
+        const std::string odom_topic = make_topic_from_pattern(own_odom_pattern_, i);
+        const std::string cmd_topic  = make_topic_from_pattern(cmd_vel_pattern_,  i);
+
+        // 각 에이전트별 /odom 구독
+        own_odom_subs_[i] = this->create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic, 10,
+        [this, i](const nav_msgs::msg::Odometry::SharedPtr msg)
+        {
+            this->ownOdomCallbackIdx(i, msg);
+        });
+
+        // 각 에이전트별 /cmd_vel 발행
+        cmd_pubs_[i] = this->create_publisher<geometry_msgs::msg::Twist>(cmd_topic, 10);
+
+        RCLCPP_INFO(get_logger(), "Agent[%zu]: id=%s, odom=%s, cmd=%s",
+                    i, agent_ids_[i].c_str(), odom_topic.c_str(), cmd_topic.c_str());
+    }
+
+    // 공용 플록 토픽: 모든 노드가 서로의 상태를 공유
     flock_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    "/flock/odometry", rclcpp::QoS(50).best_effort(),
-    std::bind(&FlockingNode::flockOdomCallback, this, _1));
-
+        "/flock/odometry", rclcpp::QoS(50).best_effort(),
+        std::bind(&FlockingNode::flockOdomCallback, this, _1));
 
     flock_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/flock/odometry", rclcpp::QoS(50).best_effort());
-    cmd_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
-
 
     const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / loop_rate_hz_));
     timer_ = this->create_wall_timer(period, std::bind(&FlockingNode::controlTimerCB, this));
 
-
-    RCLCPP_INFO(get_logger(), "Flocking node started. id=%s", agent_id_.c_str());
+    RCLCPP_INFO(get_logger(), "Flocking node (multi-agent) started. agent_count=%zu", agent_count_);
 }
 
-void FlockingNode::ownOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+// --- 각 에이전트의 /odom 콜백 (인덱스로 구분) ---
+void FlockingNode::ownOdomCallbackIdx(size_t idx, const nav_msgs::msg::Odometry::SharedPtr msg)
 {
-    // Republish to shared flock topic with frame_id = agent_id_
+    if (idx >= agent_ids_.size()) return;
+    const std::string &my_id = agent_ids_[idx];
+
+    // 공용 토픽으로 재발행 (frame_id = my_id)
     auto repub = *msg;
-    repub.header.frame_id = agent_id_;
+    repub.header.frame_id = my_id;
     flock_pub_->publish(repub);
 
-    // store as self state
+    // 내부 상태 저장
     AgentState self;
     self.pos = Eigen::Vector2d(msg->pose.pose.position.x, msg->pose.pose.position.y);
     self.vel = Eigen::Vector2d(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
     self.yaw = tf2::getYaw(msg->pose.pose.orientation);
     self.stamp = msg->header.stamp;
 
+    RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 1000,
+    "RX ODOM [%s] stamp=(%u.%u) x=%.2f y=%.2f",
+    my_id.c_str(), msg->header.stamp.sec, msg->header.stamp.nanosec,
+    msg->pose.pose.position.x, msg->pose.pose.position.y);
+
     std::scoped_lock lk(mtx_);
-    states_[agent_id_] = self;
+    states_[my_id] = self;
 }
 
+// --- 공용 토픽 수신: 모든 에이전트 상태 갱신 ---
 void FlockingNode::flockOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
     const std::string id = msg->header.frame_id.empty() ? std::string("unknown") : msg->header.frame_id;
@@ -81,71 +136,78 @@ void FlockingNode::flockOdomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
     st.yaw = tf2::getYaw(msg->pose.pose.orientation);
     st.stamp = msg->header.stamp;
 
-
     std::scoped_lock lk(mtx_);
     states_[id] = st;
 }
 
-
+// Key Control Loop
+// --- 주기 제어 루프: 모든 에이전트에 대해 계산 & 발행 ---
 void FlockingNode::controlTimerCB()
 {
-    // Collect self
+  // 오래된 이웃 제거
+  {
+    std::scoped_lock lk(mtx_);
+    pruneStale(stale_sec_);
+  }
+
+  const double dt = 1.0 / loop_rate_hz_;
+
+  // 모든 에이전트 반복
+  for (size_t i = 0; i < agent_ids_.size(); ++i)
+  { 
+    const std::string &my_id = agent_ids_[i];
+
     AgentState self;
     {
-        std::scoped_lock lk(mtx_);
-        pruneStale(stale_sec_);
-        auto it = states_.find(agent_id_);
-        if (it == states_.end()) {
-            // 아직 own odom 수신 전
-            return;
+      std::scoped_lock lk(mtx_);
+      auto it = states_.find(my_id);
+      if (it == states_.end()) {
+        // 아직 내 /odom 미수신 → 스킵
+        continue;
+      }
+      std::cout<<"ddd"<<std::endl;
+      self = it->second;
     }
-        self = it->second;
-}
 
-
-    // Compute forces
+    // 보이드 힘 합력
     Eigen::Vector2d f = Eigen::Vector2d::Zero();
-    f += k_sep_ * sepForce(self);
+    f += k_sep_   * sepForce(self);
     f += k_align_ * alignForce(self);
-    f += k_coh_ * cohForce(self);
+    f += k_coh_   * cohForce(self);
     if (use_boundary_) f += k_bound_ * boundaryForce(self);
-
-
     f = sat2D(f, max_force_);
 
-
-    // Desired velocity update (simple Euler step)
-    const double dt = 1.0 / loop_rate_hz_;
+    // 속도 갱신 (이산 적분) + 포화
     Eigen::Vector2d v_des = self.vel + f * dt;
     v_des = sat2D(v_des, max_speed_);
 
-
-    // Convert to unicycle Twist (linear.x & angular.z)
     const double speed = v_des.norm();
     const double heading_des = std::atan2(v_des.y(), v_des.x());
-    const double err = wrapAngle(heading_des - self.yaw);
-
+    const double err = wrapAngle(heading_des - (self.yaw));
 
     geometry_msgs::msg::Twist cmd;
-    cmd.linear.x = speed; // surge
-    cmd.angular.z = k_yaw_ * err; // yaw rate command
-    cmd_pub_->publish(cmd);
+    cmd.linear.x  = speed;
+    cmd.angular.z = k_yaw_ * err;
+
+    // 에이전트별 퍼블리셔로 발행
+    std::cout<<"cmd"<<std::endl;
+    if (cmd_pubs_[i]) cmd_pubs_[i]->publish(cmd);
+  }
 }
 
+// --- Forces (이웃은 states_ 사용: mutex 보호) ---
 Eigen::Vector2d FlockingNode::sepForce(const AgentState &self)
 {
-    // Strong repulsion when within r_separation
     Eigen::Vector2d acc = Eigen::Vector2d::Zero();
     int count = 0;
     std::scoped_lock lk(mtx_);
     for (const auto &kv : states_) {
         const auto &id = kv.first;
-        if (id == agent_id_) continue;
-        const auto &s = kv.second;
+        const auto &s  = kv.second;
+        if ((self.pos - s.pos).squaredNorm() < 1e-12) continue; // 자기 자신 또는 동일 위치 필터
         const Eigen::Vector2d d = self.pos - s.pos;
         const double dist = d.norm();
         if (dist > 1e-6 && dist < r_separation_) {
-            // inverse-square repulsion
             acc += d.normalized() * (1.0 / (dist * dist));
             count++;
         }
@@ -154,85 +216,70 @@ Eigen::Vector2d FlockingNode::sepForce(const AgentState &self)
     return sat2D(acc, max_force_);
 }
 
-
+// Align (정렬)
 Eigen::Vector2d FlockingNode::alignForce(const AgentState &self)
 {
-    Eigen::Vector2d avg_v = Eigen::Vector2d::Zero();
-    int count = 0;
-    std::scoped_lock lk(mtx_);
-    for (const auto &kv : states_) {
-        const auto &id = kv.first;
-        if (id == agent_id_) continue;
-        const auto &s = kv.second;
-        const double dist = (self.pos - s.pos).norm();
-        if (dist < r_neighbor_) {
-            avg_v += s.vel;
-            count++;
-        }
+  Eigen::Vector2d avg_v = Eigen::Vector2d::Zero();
+  int count = 0;
+  std::scoped_lock lk(mtx_);
+  for (const auto &kv : states_) {
+    const auto &s = kv.second;
+    const double dist = (self.pos - s.pos).norm();
+    if (dist < r_neighbor_ && dist > 1e-6) {
+      avg_v += s.vel;
+      count++;
     }
-    if (count == 0) return Eigen::Vector2d::Zero();
-    avg_v /= static_cast<double>(count);
-    // steer towards average velocity
-    Eigen::Vector2d steer = avg_v - self.vel;
-    return sat2D(steer, max_force_);
+  }
+  if (count == 0) return Eigen::Vector2d::Zero();
+  avg_v /= static_cast<double>(count);
+  Eigen::Vector2d steer = avg_v - self.vel;
+  return sat2D(steer, max_force_);
 }
 
+// Cohesion
 Eigen::Vector2d FlockingNode::cohForce(const AgentState &self)
 {
-    Eigen::Vector2d center = Eigen::Vector2d::Zero();
-    int count = 0;
-    std::scoped_lock lk(mtx_);
-    for (const auto &kv : states_) {
-        const auto &id = kv.first;
-        if (id == agent_id_) continue;
-        const auto &s = kv.second;
-        const double dist = (self.pos - s.pos).norm();
-        if (dist < r_neighbor_) {
-            center += s.pos;
-            count++;
-        }
+  Eigen::Vector2d center = Eigen::Vector2d::Zero();
+  int count = 0;
+  std::scoped_lock lk(mtx_);
+  for (const auto &kv : states_) {
+    const auto &s = kv.second;
+    const double dist = (self.pos - s.pos).norm();
+    if (dist < r_neighbor_ && dist > 1e-6) {
+      center += s.pos;
+      count++;
     }
-    if (count == 0) return Eigen::Vector2d::Zero();
-    center /= static_cast<double>(count);
-    // desired direction to center
-    Eigen::Vector2d desired = center - self.pos;
-    // target speed proportional to distance (clamped)
-    if (desired.norm() > 1e-6) desired = desired.normalized() * std::min(max_speed_, desired.norm());
-    Eigen::Vector2d steer = desired - self.vel;
-    return sat2D(steer, max_force_);
+  }
+  if (count == 0) return Eigen::Vector2d::Zero();
+  center /= static_cast<double>(count);
+  Eigen::Vector2d desired = center - self.pos;
+  if (desired.norm() > 1e-6) desired = desired.normalized() * std::min(max_speed_, desired.norm());
+  Eigen::Vector2d steer = desired - self.vel;
+  return sat2D(steer, max_force_);
 }
 
+// 옵션 --> 사각 영역 xmin..xmax, ymin..ymax로 keep-in.
 Eigen::Vector2d FlockingNode::boundaryForce(const AgentState &self)
 {
-    // Simple rectangular keep-in using 1/distance repulsion near walls
-    const double margin = r_neighbor_ * 0.5; // start pushing before hitting boundary
-    Eigen::Vector2d f = Eigen::Vector2d::Zero();
-
-
-    const double x = self.pos.x();
-    const double y = self.pos.y();
-
-
-    if (x - xmin_ < margin) f.x() += 1.0 / std::max(1e-3, (x - xmin_));
-    if (xmax_ - x < margin) f.x() -= 1.0 / std::max(1e-3, (xmax_ - x));
-    if (y - ymin_ < margin) f.y() += 1.0 / std::max(1e-3, (y - ymin_));
-    if (ymax_ - y < margin) f.y() -= 1.0 / std::max(1e-3, (ymax_ - y));
-
-
-    return sat2D(f, max_force_);
+  const double margin = r_neighbor_ * 0.5;
+  Eigen::Vector2d f = Eigen::Vector2d::Zero();
+  const double x = self.pos.x();
+  const double y = self.pos.y();
+  if (x - xmin_ < margin) f.x() += 1.0 / std::max(1e-3, (x - xmin_));
+  if (xmax_ - x < margin) f.x() -= 1.0 / std::max(1e-3, (xmax_ - x));
+  if (y - ymin_ < margin) f.y() += 1.0 / std::max(1e-3, (y - ymin_));
+  if (ymax_ - y < margin) f.y() -= 1.0 / std::max(1e-3, (ymax_ - y));
+  return sat2D(f, max_force_);
 }
 
 void FlockingNode::pruneStale(double max_age_sec)
 {
-    const rclcpp::Time now = this->now();
-    for (auto it = states_.begin(); it != states_.end(); )
-    {
-        const double age = (now - it->second.stamp).seconds();
-        if (age > max_age_sec)
-        it = states_.erase(it);
-        else
-        ++it;
-    }
+  const rclcpp::Time now = this->now();
+  for (auto it = states_.begin(); it != states_.end(); ) {
+    const double age = (now - it->second.stamp).seconds();
+    if (age > max_age_sec) it = states_.erase(it);
+    else ++it;
+  }
 }
 
 // --- utils ---
